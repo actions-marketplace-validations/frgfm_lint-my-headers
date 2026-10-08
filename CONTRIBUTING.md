@@ -4,7 +4,7 @@ Follow the [code of conduct](CODE_OF_CONDUCT.md), [runtime contracts](README.md)
 
 ## Structure
 
-- `rust/analysis.rs`: header recognition and proposed year replacements.
+- `rust/analysis.rs`: header recognition, proposed year replacements, and declared missing-header insertion.
 - `rust/filesystem.rs`: discovery, identity checks, and atomic writes.
 - `rust/config.rs`, `rust/lib.rs`: configuration, command execution, and output.
 - `tests/cli.rs` and Rust module tests: CLI and safety regression coverage.
@@ -32,7 +32,7 @@ git diff --check
 
 `make style` applies formatting fixes. Review its diff. `make spdx-check` verifies the exact pinned snapshot and generated legacy compatibility data; use `python scripts/update_spdx_licenses.py --help` for deliberate updates.
 
-Keep regressions covered at the layer that owns the behavior. Preserve read-only checks, year-only repairs, all other bytes/mode, link/race refusal, JSON, exit codes, and Action outputs. Never infer legal ownership or licensing.
+Keep regressions covered at the layer that owns the behavior. Preserve read-only checks, limited end-year repairs, explicit creation years for header insertion, existing bytes/mode, link/race refusal, JSON, exit codes, and Action outputs. Never infer ownership, licensing, or creation years.
 
 `lmh` tests the source hook. The wheel-hook smoke tests use the artifacts from
 `make package-check` with fresh caches and compiler guards. They check Python
@@ -153,7 +153,22 @@ serves assets only below `/lint-my-headers/`. Future projects can use more-speci
 which take precedence over the
 [Custom Domain](https://developers.cloudflare.com/workers/configuration/routing/custom-domains/).
 Coordinate hostname-level settings when adding projects. Wrangler disables
-`workers.dev` and version-preview URLs to keep a single public canonical origin.
+production `workers.dev` and version URLs. Pull requests use separate Worker
+Previews.
+
+Enable **Preview Builds** under the Worker's **Settings > Build > Branch control**.
+Use the same build command as production and set the Preview command to
+`npx --yes wrangler@4.147.0 preview`. The empty `[previews]` block in
+`wrangler.toml` enables Previews, which use the assets built from each branch.
+Cloudflare posts the Preview link on the GitHub pull request.
+
+Append this step after `make docs-cloudflare` in the Preview build command:
+
+```shell
+printf '%s\n' '/ /lint-my-headers/ 302' > .docs-site/_redirects
+```
+
+It redirects the Preview's root URL to the project docs.
 
 For local Cloudflare routing checks after `make docs-cloudflare`, use Node 22+
 and the Wrangler version pinned in the workflow:
