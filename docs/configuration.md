@@ -51,12 +51,16 @@ SwiftPM/Xcode projects, and shell or C/C++ projects can use `.lmh.toml`;
 | --- | --- |
 | `owner` / `--owner` | Required exact, single-line copyright owner. |
 | `starting-year` / `--starting-year` | Required earliest accepted file creation year. |
+| `creation-year` / `--creation-year` | Unreleased source only. Optional declared first year for inserting missing headers; default unset. Applies to all selected missing headers, not existing ones. |
 | `license` / `--license` | SPDX identifier selecting a prose notice; requires a local `LICENSE`. |
 | `license-notice` / `--license-notice` | Custom notice file; configure exactly one license source. |
 | `paths` / positional paths | Selected files or directories; default `.`. |
 | `languages` / `--languages` | Non-empty language allowlist; default `["python"]`. |
 | `ignore-files` / `--ignore-files` | Exact excluded basenames; default `["__init__.py"]`. |
 | `ignore-folders` / `--ignore-folders` | Excluded subtrees; default `[".github"]`. |
+
+Select files with the same actual creation year when inserting headers. Run
+separately for each year; one shared `creation-year` does not describe mixed-age files.
 
 Configuration lists are arrays. CLI language and ignore lists are comma-separated
 and replace the corresponding configured list:
@@ -100,6 +104,37 @@ markers. Blank notices fail with exit 2 before source files are checked or repai
 Notice lines must match in full, including the final line when the notice file has
 no trailing newline.
 
+### Additional layouts (unreleased)
+
+These layouts require the source checkout. Published **0.7.0** uses the prose
+layout above. Existing-header repairs still change only the end year.
+
+| Layout | Rules |
+| --- | --- |
+| Prose | `Copyright`, `Copyright (C)`, or `Copyright (c)`, followed by a four-digit year/range and the exact owner. Comma and final period are optional. Keep one blank or marker-only line before the matching notice. |
+| Ordinary block | Languages using `//` also accept the whole header inside `/* ... */`. Leading `*` markers are optional; the closing delimiter may follow the final notice. |
+| SPDX pair | One `SPDX-FileCopyrightText` and one `SPDX-License-Identifier`, in either order with optional blank lines. Owner and configured identifier must match exactly. Keep the local `LICENSE`. |
+
+For example, with `owner = "Example Organization"` and `license = "Apache-2.0"`:
+
+```c
+/*
+ * SPDX-FileCopyrightText: 2024-2026 Example Organization
+ * SPDX-License-Identifier: Apache-2.0
+ */
+```
+
+The pair also works in line comments: `#` for Python/Bash, `//` for other
+languages. A prose copyright with an SPDX identifier is accepted, as is a full
+prose notice followed by a matching identifier. Custom notices must match in
+full, including text after any SPDX tag; compound expressions are not evaluated.
+
+SPDX-only blocks contain only the pair and blank lines. Separate later
+line-comment notes with a blank line. Conflicting legal text anywhere in the
+leading comments, duplicate fields, nested legal blocks, and documentation
+comment headers refuse repair. Multiple holders, omitted years, sidecars, and
+`REUSE.toml` are unsupported. LMH checks declared policy, not legal compliance.
+
 ??? note "Python"
     UTF-8 BOM, shebang, and PEP 263 cookie are preserved. Verified encodings:
     UTF-8, ASCII, Latin-1, and Windows-1252. Other codecs fail without repair.
@@ -133,7 +168,9 @@ no trailing newline.
 Validation stops at the first code line after allowed preambles and leading
 comments/blank lines. Later copyright notices and body syntax errors are ignored;
 the entire file must still decode successfully. Duplicate notices and
-copyright-bearing block/doc comments in the leading region refuse repair.
+copyright-bearing documentation comments in the leading region refuse repair.
+Published 0.7.0 also refuses copyright-bearing ordinary blocks; the unreleased
+layouts above support unambiguous ordinary blocks.
 Directory discovery skips symlinks and reparse points. Explicit linked
 files may be checked, but repairs refuse linked files/parents, multiple hard
 links, and concurrently changed targets.

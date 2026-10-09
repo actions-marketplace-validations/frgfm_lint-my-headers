@@ -5,7 +5,7 @@ use std::{borrow::Cow, fs, sync::LazyLock};
 
 static COPYRIGHT: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"^Copyright \(C\) (?P<years>(?P<start>[0-9]{4})(?:-(?P<end>[0-9]{4}))?), (?P<owner>.*)\.$",
+        r"^(?:Copyright(?: \([cC]\))? |SPDX-FileCopyrightText: )(?P<years>(?P<start>[0-9]{4})(?:-(?P<end>[0-9]{4}))?),? (?P<owner>.+)$",
     )
     .expect("valid copyright expression")
 });
@@ -57,6 +57,14 @@ pub fn build_policy(settings: &Settings, current_year: i32) -> Result<HeaderPoli
     if settings.year < 1000 || settings.year > current_year {
         return Err(format!("Invalid first copyright year: {}", settings.year));
     }
+    if settings.creation_year.is_some_and(|year| {
+        !(1000..=9999).contains(&year) || year < settings.year || year > current_year
+    }) {
+        return Err(
+            "creation-year must be a four-digit year between starting-year and the current year"
+                .into(),
+        );
+    }
     if settings.owner.is_empty() || settings.owner.contains(['\n', '\r']) {
         return Err("Please specify a single-line copyright owner".into());
     }
@@ -95,6 +103,7 @@ pub fn build_policy(settings: &Settings, current_year: i32) -> Result<HeaderPoli
         if notices.is_empty() {
             return Err(format!("Invalid license identifier: {id}"));
         }
+        notices.push(format!("SPDX-License-Identifier: {id}\n"));
     } else if let Some(path) = &settings.license_notice {
         if !path.is_file() {
             return Err("Unable to locate the text of the license notice.".into());
@@ -123,6 +132,7 @@ pub fn build_policy(settings: &Settings, current_year: i32) -> Result<HeaderPoli
         owner: settings.owner.clone(),
         starting_year: settings.year,
         current_year,
+        creation_year: settings.creation_year,
         expected_header: format!(
             "Copyright (C) {years}, {}.\n\n{}",
             settings.owner, notices[0]
@@ -140,21 +150,34 @@ pub struct ContentAnalysis {
 #[derive(Default)]
 pub(crate) struct Inspection {
     pub diagnostic: Option<Diagnostic>,
-    pub edit: Option<YearEdit>,
+    pub edit: Option<Edit>,
 }
 
-pub(crate) struct YearEdit {
-    range: std::ops::Range<usize>,
-    start: i32,
-    end: i32,
+pub(crate) enum Edit {
+    Year {
+        range: std::ops::Range<usize>,
+        start: i32,
+        end: i32,
+    },
+    Insert {
+        offset: usize,
+        header: Vec<u8>,
+    },
 }
 
-impl YearEdit {
+impl Edit {
     pub fn apply(&self, raw: &[u8]) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(raw.len().saturating_add(5));
-        bytes.extend_from_slice(&raw[..self.range.start]);
-        bytes.extend_from_slice(format!("{}-{}", self.start, self.end).as_bytes());
-        bytes.extend_from_slice(&raw[self.range.end..]);
+        let (range, text) = match self {
+            Self::Year { range, start, end } => (
+                range.clone(),
+                Cow::Owned(format!("{start}-{end}").into_bytes()),
+            ),
+            Self::Insert { offset, header } => (*offset..*offset, Cow::Borrowed(header.as_slice())),
+        };
+        let mut bytes = Vec::with_capacity(raw.len().saturating_add(text.len()));
+        bytes.extend_from_slice(&raw[..range.start]);
+        bytes.extend_from_slice(&text);
+        bytes.extend_from_slice(&raw[range.end..]);
         bytes
     }
 }
@@ -199,7 +222,20 @@ fn encoding_cookie(line: &[u8]) -> Result<Option<String>, String> {
     }))
 }
 
-fn decode_source(raw: &[u8]) -> Result<Cow<'_, str>, String> {
+#[derive(Clone, Copy)]
+enum SourceEncoding {
+    Utf8,
+    Ascii,
+    Latin1,
+    Windows1252,
+}
+
+const CP1252_EXTENDED: [char; 32] = [
+    '€', '\0', '‚', 'ƒ', '„', '…', '†', '‡', 'ˆ', '‰', 'Š', '‹', 'Œ', '\0', 'Ž', '\0', '\0', '‘',
+    '’', '“', '”', '•', '–', '—', '˜', '™', 'š', '›', 'œ', '\0', 'ž', 'Ÿ',
+];
+
+fn source_encoding(raw: &[u8]) -> Result<SourceEncoding, String> {
     let bom = raw.starts_with(b"\xef\xbb\xbf");
     let raw = if bom { &raw[3..] } else { raw };
     let mut lines = raw.split_inclusive(|byte| *byte == b'\n');
@@ -214,12 +250,29 @@ fn decode_source(raw: &[u8]) -> Result<Cow<'_, str>, String> {
     }
     match label {
         "utf-8" | "utf8" | "u8" | "utf" | "cp65001" | "utf8-ucs2" | "utf8-ucs4" => {
+            Ok(SourceEncoding::Utf8)
+        }
+        "ascii" | "us-ascii" | "646" | "ansi-x3.4-1968" | "ansi-x3.4-1986" | "ansi-x3-4-1968"
+        | "cp367" | "csascii" | "ibm367" | "iso646-us" | "iso-646.irv-1991" | "iso-ir-6" | "us" => {
+            Ok(SourceEncoding::Ascii)
+        }
+        "latin-1" | "latin1" | "iso8859-1" | "iso-8859-1" | "l1" | "8859" | "cp819" | "ibm819"
+        | "csisolatin1" | "iso8859" | "iso-ir-100" | "latin" => Ok(SourceEncoding::Latin1),
+        "cp1252" | "windows-1252" | "1252" => Ok(SourceEncoding::Windows1252),
+        _ => Err(format!("unsupported source encoding: {label}")),
+    }
+}
+
+fn decode_source(raw: &[u8]) -> Result<Cow<'_, str>, String> {
+    let encoding = source_encoding(raw)?;
+    let raw = raw.strip_prefix(b"\xef\xbb\xbf").unwrap_or(raw);
+    match encoding {
+        SourceEncoding::Utf8 => {
             return std::str::from_utf8(raw)
                 .map(Cow::Borrowed)
                 .map_err(|e| e.to_string());
         }
-        "ascii" | "us-ascii" | "646" | "ansi-x3.4-1968" | "ansi-x3.4-1986" | "ansi-x3-4-1968"
-        | "cp367" | "csascii" | "ibm367" | "iso646-us" | "iso-646.irv-1991" | "iso-ir-6" | "us" => {
+        SourceEncoding::Ascii => {
             return if raw.is_ascii() {
                 Ok(Cow::Borrowed(
                     std::str::from_utf8(raw).expect("ASCII is UTF-8"),
@@ -228,14 +281,12 @@ fn decode_source(raw: &[u8]) -> Result<Cow<'_, str>, String> {
                 Err("invalid byte in ASCII source".into())
             };
         }
-        "latin-1" | "latin1" | "iso8859-1" | "iso-8859-1" | "l1" | "8859" | "cp819" | "ibm819"
-        | "csisolatin1" | "iso8859" | "iso-ir-100" | "latin" => {
+        SourceEncoding::Latin1 => {
             return Ok(Cow::Owned(
                 raw.iter().map(|byte| char::from(*byte)).collect(),
             ));
         }
-        "cp1252" | "windows-1252" | "1252" => {}
-        _ => return Err(format!("unsupported source encoding: {label}")),
+        SourceEncoding::Windows1252 => {}
     }
     // Python rejects the five undefined Windows-1252 byte values.
     if raw
@@ -244,10 +295,6 @@ fn decode_source(raw: &[u8]) -> Result<Cow<'_, str>, String> {
     {
         return Err("undefined byte in Windows-1252 source".into());
     }
-    const CP1252_EXTENDED: [char; 32] = [
-        '€', '\0', '‚', 'ƒ', '„', '…', '†', '‡', 'ˆ', '‰', 'Š', '‹', 'Œ', '\0', 'Ž', '\0', '\0',
-        '‘', '’', '“', '”', '•', '–', '—', '˜', '™', 'š', '›', 'œ', '\0', 'ž', 'Ÿ',
-    ];
     Ok(Cow::Owned(
         raw.iter()
             .map(|&byte| {
@@ -259,6 +306,32 @@ fn decode_source(raw: &[u8]) -> Result<Cow<'_, str>, String> {
             })
             .collect(),
     ))
+}
+
+impl SourceEncoding {
+    fn encode(self, text: &str) -> Option<Vec<u8>> {
+        match self {
+            Self::Utf8 => Some(text.as_bytes().to_vec()),
+            Self::Ascii => text.is_ascii().then(|| text.as_bytes().to_vec()),
+            Self::Latin1 => text
+                .chars()
+                .map(|c| u8::try_from(u32::from(c)).ok())
+                .collect(),
+            Self::Windows1252 => text
+                .chars()
+                .map(|c| {
+                    if c <= '\u{7f}' || ('\u{a0}'..='\u{ff}').contains(&c) {
+                        u8::try_from(u32::from(c)).ok()
+                    } else {
+                        CP1252_EXTENDED
+                            .iter()
+                            .position(|&value| value == c && value != '\0')
+                            .map(|index| 0x80 + index as u8)
+                    }
+                })
+                .collect(),
+        }
+    }
 }
 
 fn is_shebang(source: &str, language: Language) -> bool {
@@ -311,10 +384,43 @@ fn preamble(lines: &[&str], language: Language) -> (usize, bool) {
     (end + usize::from(separator), separator)
 }
 
+fn is_copyright(text: &str) -> bool {
+    text.starts_with("Copyright") || text.starts_with("SPDX-FileCopyrightText:")
+}
+
+fn prose_license_count(text: &str) -> usize {
+    // Count licensing text outside structured fields, then allow only the configured notice.
+    text.lines()
+        .filter(|line| {
+            let text = line.trim_start_matches([' ', '\t', '#', '/', '*', '!']);
+            !is_copyright(text)
+                && !text.starts_with("SPDX-License-Identifier:")
+                // Canonical notice lines need no lowercase copy or keyword scan.
+                && (text.starts_with("This program is licensed under ")
+                    || text.starts_with("Licensed under ")
+                    || text.starts_with("See LICENSE or go to ")
+                    || text
+                    // Mentions of a field name inside ordinary text are not declarations.
+                    .split("SPDX-License-Identifier:")
+                    .any(mentions_licensing)
+                    || mentions_leading_attribution(text))
+        })
+        .count()
+}
+
 // Inspect only the leading comment region; the first code token ends header validation.
-fn leading_comments(source: &str, language: Language) -> (usize, Vec<(usize, &str)>, bool) {
+#[derive(Default)]
+struct LeadingComments<'a> {
+    end: usize,
+    copyrights: Vec<(usize, &'a str)>,
+    ambiguous: bool,
+    identifiers: usize,
+    prose_licenses: usize,
+}
+
+fn leading_comments(source: &str, language: Language) -> LeadingComments<'_> {
     let mut remaining = source;
-    let mut comments = Vec::new();
+    let mut result = LeadingComments::default();
     let mut line = 0;
     loop {
         let trimmed = remaining.trim_start_matches([' ', '\t', '\x0c', '\r', '\n']);
@@ -330,15 +436,26 @@ fn leading_comments(source: &str, language: Language) -> (usize, Vec<(usize, &st
             let text = remaining[..end].trim_end_matches(['\r', '\n']);
             if !shebang {
                 let tail = &text[language.comment().len()..];
-                if tail.starts_with(" Copyright")
+                let field = if language.comment() == "//" {
+                    tail.trim_start_matches('/')
+                        .trim_start_matches('!')
+                        .trim_start()
+                } else {
+                    tail.trim_start()
+                };
+                result.identifiers += usize::from(field.starts_with("SPDX-License-Identifier:"));
+                result.prose_licenses += prose_license_count(field);
+                if is_copyright(tail.trim_start())
                     || (language.comment() == "//"
-                        && tail
-                            .trim_start_matches('/')
-                            .trim_start_matches('!')
-                            .trim_start()
-                            .starts_with("Copyright"))
+                        && is_copyright(
+                            tail.trim_start_matches('/')
+                                .trim_start_matches('!')
+                                .trim_start(),
+                        ))
                 {
-                    comments.push((line, tail.strip_prefix(' ').unwrap_or(text)));
+                    result
+                        .copyrights
+                        .push((line, tail.strip_prefix(' ').unwrap_or(text)));
                 }
             }
             end
@@ -360,19 +477,184 @@ fn leading_comments(source: &str, language: Language) -> (usize, Vec<(usize, &st
                     depth -= 1;
                     end += close + 2;
                 } else {
-                    return (source.len(), comments, true);
+                    result.end = source.len();
+                    result.ambiguous = true;
+                    return result;
                 }
             }
             if remaining[..end].contains("Copyright") {
-                comments.push((line, &remaining[..end]));
+                result.copyrights.push((line, &remaining[..end]));
             }
+            let content = &remaining[2..end - 2];
+            result.prose_licenses += prose_license_count(content);
+            result.identifiers += content
+                .lines()
+                .filter(|line| {
+                    line.trim_start_matches([' ', '\t', '/', '*', '!'])
+                        .starts_with("SPDX-License-Identifier:")
+                })
+                .count();
             end
         } else {
-            return (offset, comments, false);
+            result.end = offset;
+            return result;
         };
         line += remaining[..end].bytes().filter(|&b| b == b'\n').count();
         remaining = &remaining[end..];
     }
+}
+
+fn block_header(comment: &str) -> Option<Vec<String>> {
+    let text = comment
+        .strip_prefix("/*")?
+        .strip_suffix("*/")?
+        .trim_end_matches([' ', '\t']);
+    // Documentation comments and nested delimiters need manual review.
+    if text.starts_with(['*', '!']) || text.contains("/*") || text.contains("*/") {
+        return None;
+    }
+    Some(
+        text.split_inclusive('\n')
+            .map(|line| {
+                let line = line.trim_start_matches([' ', '\t']);
+                let line = line
+                    .strip_prefix('*')
+                    .map(|text| text.strip_prefix(' ').unwrap_or(text))
+                    .unwrap_or(line);
+                let mut line = normalize_newlines(line);
+                // A closing delimiter completes the final notice line without adding source bytes.
+                if !line.ends_with('\n') {
+                    line.push('\n');
+                }
+                line
+            })
+            .collect(),
+    )
+}
+
+fn mentions_licensing(text: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    [
+        "copyright",
+        "©",
+        "spdx",
+        "license",
+        "licence",
+        "all rights reserved",
+    ]
+    .iter()
+    .any(|word| text.contains(word))
+}
+
+fn mentions_leading_attribution(text: &str) -> bool {
+    let text = text.trim_start_matches([' ', '\t', '#', '/', '*', '!']);
+    text.strip_prefix("(c)")
+        .or_else(|| text.strip_prefix("(C)"))
+        .is_some_and(|tail| {
+            tail.trim_start()
+                .as_bytes()
+                .get(..4)
+                .is_some_and(|year| year.iter().all(u8::is_ascii_digit))
+        })
+}
+
+fn licensing_docstring(source: &str) -> bool {
+    let source = source.trim_start();
+    // Parentheses, joined literals, and escapes can hide legal text. Leave these forms for review.
+    if source.starts_with('(') {
+        return true;
+    }
+    let literal = source.trim_start_matches(['b', 'B', 'f', 'F', 'r', 'R', 'u', 'U', 't', 'T']);
+    let unsupported_prefix =
+        source[..source.len() - literal.len()].contains(['b', 'B', 'f', 'F', 't', 'T']);
+    let source = literal;
+    let bytes = source.as_bytes();
+    let Some(&quote) = bytes.first().filter(|&&byte| matches!(byte, b'\'' | b'"')) else {
+        return false;
+    };
+    if unsupported_prefix {
+        return true;
+    }
+    let width = if bytes.starts_with(&[quote; 3]) { 3 } else { 1 };
+    let delimiter = [quote; 3];
+    let mut index = width;
+    while index < bytes.len() {
+        if bytes[index] == b'\\' {
+            return true;
+        } else if bytes[index..].starts_with(&delimiter[..width]) {
+            let tail = source[index + width..].trim_start();
+            let tail = tail.trim_start_matches(['b', 'B', 'f', 'F', 'r', 'R', 'u', 'U', 't', 'T']);
+            return mentions_licensing(&source[width..index])
+                || tail.starts_with(['\'', '"', '\\']);
+        } else {
+            index += 1;
+        }
+    }
+    true
+}
+
+fn missing_header_edit(
+    raw: &[u8],
+    policy: &HeaderPolicy,
+    language: Language,
+    header_index: usize,
+    separator_valid: bool,
+) -> Option<Edit> {
+    let year = policy.creation_year?;
+    if !(1000..=9999).contains(&year)
+        || year < policy.starting_year
+        || year > policy.current_year
+        || !(1000..=9999).contains(&policy.current_year)
+    {
+        return None;
+    }
+    let years = if year == policy.current_year {
+        year.to_string()
+    } else {
+        format!("{year}-{}", policy.current_year)
+    };
+    let notice = policy.license_notices.first()?;
+    let mut text = render_header(
+        &format!("Copyright (C) {years}, {}.\n\n{notice}", policy.owner),
+        language,
+    );
+    if text.contains('\0') {
+        return None;
+    }
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push('\n');
+    let bom = usize::from(raw.starts_with(b"\xef\xbb\xbf")) * 3;
+    let body = &raw[bom..];
+    let offset = bom
+        + body
+            .split_inclusive(|&byte| byte == b'\n')
+            .take(header_index)
+            .map(<[u8]>::len)
+            .sum::<usize>();
+    let crlf = body
+        .iter()
+        .position(|&byte| byte == b'\n')
+        .is_some_and(|index| index > 0 && body[index - 1] == b'\r');
+    if header_index > 0 && !separator_valid {
+        text.insert(0, '\n');
+        if raw.get(offset.wrapping_sub(1)) != Some(&b'\n') {
+            text.insert(0, '\n');
+        }
+    }
+    if crlf {
+        text = text.replace('\n', "\r\n");
+    }
+    let encoding = if language == Language::Python {
+        source_encoding(raw).ok()?
+    } else {
+        SourceEncoding::Utf8
+    };
+    Some(Edit::Insert {
+        offset,
+        header: encoding.encode(&text)?,
+    })
 }
 
 pub fn analyze(raw: &[u8], policy: &HeaderPolicy, display_path: &str) -> ContentAnalysis {
@@ -403,7 +685,21 @@ pub(crate) fn inspect(raw: &[u8], policy: &HeaderPolicy, display_path: &str) -> 
             );
         }
     };
-    let (end, comments, ambiguous_header) = leading_comments(&source, language);
+    let LeadingComments {
+        end,
+        copyrights: comments,
+        ambiguous: ambiguous_header,
+        identifiers: identifier_count,
+        prose_licenses,
+    } = leading_comments(&source, language);
+    // ponytail: a whole-file keyword guard can reject examples and variable names; use a parser only if these refusals become a problem.
+    let licensing_text = policy.creation_year.is_some()
+        && comments.is_empty()
+        && (mentions_licensing(&source) || source[..end].lines().any(mentions_leading_attribution));
+    let licensing_literal = policy.creation_year.is_some()
+        && comments.is_empty()
+        && language == Language::Python
+        && licensing_docstring(&source[end..]);
     let source = &source[..end];
     let ambiguous_header = ambiguous_header
         || (matches!(language, Language::Javascript | Language::Typescript)
@@ -420,26 +716,104 @@ pub(crate) fn inspect(raw: &[u8], policy: &HeaderPolicy, display_path: &str) -> 
     };
     let lines: Vec<&str> = source.split_inclusive('\n').collect();
     let (header_index, separator_valid) = preamble(&lines, language);
-    let captures = comments
-        .first()
-        .and_then(|(_, text)| COPYRIGHT_CACHE.with(|regex| regex.captures(text)));
-    if header_index >= lines.len() || comments.is_empty() {
+    if ambiguous_header {
         return problem(
+            display_path,
+            header_index + 1,
+            "LMH006",
+            "malformed or ambiguous header",
+        );
+    }
+    if header_index >= lines.len() || comments.is_empty() {
+        let mut result = problem(
             display_path,
             header_index + 1,
             "LMH001",
             "missing legal header",
         );
+        if policy.creation_year.is_some()
+            && !bare_cr
+            && !licensing_literal
+            && !licensing_text
+            && let Some(edit) =
+                missing_header_edit(raw, policy, language, header_index, separator_valid)
+        {
+            // Validate the generated layout before the existing guarded writer can apply it.
+            let candidate = edit.apply(raw);
+            let mut verification_policy = policy.clone();
+            verification_policy.creation_year = None;
+            if inspect(&candidate, &verification_policy, display_path)
+                .diagnostic
+                .is_none()
+            {
+                result.edit = Some(edit);
+                result
+                    .diagnostic
+                    .as_mut()
+                    .expect("missing-header diagnostic")
+                    .fixable = true;
+            }
+        }
+        if policy.creation_year.is_some() && result.edit.is_none() {
+            let reason = if licensing_text {
+                "file contains licensing text"
+            } else if licensing_literal {
+                "opening Python expression needs review"
+            } else {
+                "header cannot be inserted safely"
+            };
+            result
+                .diagnostic
+                .as_mut()
+                .expect("missing-header diagnostic")
+                .message = format!("missing legal header; {reason}; manual review required");
+        }
+        return result;
     }
-    if bare_cr
-        || ambiguous_header
-        || !separator_valid
-        || comments.len() != 1
+    let block = comments[0].1.starts_with("/*");
+    let block_lines = block.then(|| block_header(comments[0].1)).flatten();
+    let header: Vec<&str> = if let Some(block_lines) = &block_lines {
+        block_lines.iter().map(String::as_str).collect()
+    } else {
+        lines[header_index..]
+            .iter()
+            .map_while(|line| uncomment(line, language.comment()))
+            .collect()
+    };
+    let copyright_index = header.iter().position(|line| is_copyright(line));
+    let first_index = header
+        .iter()
+        .position(|line| !line.trim_end_matches('\n').is_empty());
+    let spdx_first = first_index.is_some_and(|index| {
+        header[index].starts_with("SPDX-License-Identifier:")
+            && copyright_index.is_some_and(|copyright| {
+                copyright > index
+                    && header[index + 1..copyright]
+                        .iter()
+                        .all(|line| line.trim_end_matches('\n').is_empty())
+            })
+    });
+    let copyright_text = copyright_index
+        .and_then(|index| header.get(index))
+        .map(|line| line.trim_end_matches('\n'))
+        .unwrap_or_default();
+    let captures = COPYRIGHT_CACHE.with(|regex| regex.captures(copyright_text));
+    let identifiers: Vec<_> = header
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.starts_with("SPDX-License-Identifier:"))
+        .collect();
+    let misplaced = (block && comments[0].0 != header_index)
+        || (!block && comments[0].0 != header_index + copyright_index.unwrap_or_default())
+        || (first_index != copyright_index && !spdx_first);
+    let ambiguous = comments.len() != 1
+        || identifier_count > 1
+        || identifier_count != identifiers.len()
+        || (block && block_lines.is_none())
+        || (block && header.iter().filter(|line| !line.trim().is_empty()).count() < 2)
         || captures.is_none()
-        || comments[0].0 != header_index
-        || lines[header_index].trim_end_matches('\n')
-            != format!("{} {}", language.comment(), comments[0].1)
-    {
+        || header.iter().filter(|line| is_copyright(line)).count() != 1;
+    if bare_cr || !separator_valid || misplaced || ambiguous {
         return problem(
             display_path,
             comments[0].0 + 1,
@@ -447,16 +821,23 @@ pub(crate) fn inspect(raw: &[u8], policy: &HeaderPolicy, display_path: &str) -> 
             "malformed, misplaced, or ambiguous header",
         );
     }
-    let (line_index, _) = &comments[0];
+    let copyright_index = copyright_index.expect("matched copyright line");
+    let line_index = if block { comments[0].0 } else { header_index } + copyright_index;
     let captures = captures.expect("matched copyright comment");
-    if captures["owner"] != policy.owner {
+    let owner = &captures["owner"];
+    let owner = if !copyright_text.starts_with("SPDX-FileCopyrightText:") && owner != policy.owner {
+        owner.strip_suffix('.').unwrap_or(owner)
+    } else {
+        owner
+    };
+    if owner != policy.owner {
         return problem(
             display_path,
             line_index + 1,
             "LMH002",
             format!(
                 "copyright owner is '{}'; expected '{}'",
-                &captures["owner"], policy.owner
+                owner, policy.owner
             ),
         );
     }
@@ -478,26 +859,19 @@ pub(crate) fn inspect(raw: &[u8], policy: &HeaderPolicy, display_path: &str) -> 
             ),
         );
     }
-    let blank_index = line_index + 1;
-    if !lines
-        .get(blank_index)
-        .is_some_and(|line| line.trim_end_matches('\n').is_empty())
-    {
-        return problem(
-            display_path,
-            blank_index + 1,
-            "LMH006",
-            "expected one blank line between copyright and license notice",
-        );
-    }
-    if !policy.license_notices.iter().any(|notice| {
-        let mut expected = notice.as_str();
-        for part in lines[blank_index + 1..]
-            .iter()
-            .map_while(|line| uncomment(line, language.comment()))
+    let spdx = copyright_text.starts_with("SPDX-FileCopyrightText:") || !identifiers.is_empty();
+    let notice_index = copyright_index + 2;
+    let prose_notice = policy.license_notices.iter().find(|notice| {
+        if !header
+            .get(copyright_index + 1)
+            .is_some_and(|line| line.trim_end_matches('\n').is_empty())
         {
+            return false;
+        }
+        let mut expected = notice.as_str();
+        for part in header[notice_index.min(header.len())..].iter().copied() {
             if let Some(tail) = part.strip_prefix(expected) {
-                // A notice without a final newline must still match a complete source line.
+                // A notice without a newline must still match a complete source line.
                 return expected.ends_with('\n') || tail.is_empty() || tail.starts_with('\n');
             }
             let Some(rest) = expected.strip_prefix(part) else {
@@ -506,10 +880,81 @@ pub(crate) fn inspect(raw: &[u8], policy: &HeaderPolicy, display_path: &str) -> 
             expected = rest;
         }
         expected.is_empty()
-    }) {
+    });
+    let complete_notice = prose_notice.filter(|notice| {
+        !notice.starts_with("SPDX-License-Identifier:") || notice.lines().count() > 1
+    });
+    let accepted_prose =
+        complete_notice.map_or(usize::from(!spdx), |notice| prose_license_count(notice));
+    if prose_licenses > accepted_prose {
         return problem(
             display_path,
-            blank_index + 2,
+            line_index + 1,
+            "LMH006",
+            "mixed or ambiguous license declarations",
+        );
+    }
+    if let Some(&(identifier_index, _)) = identifiers.first().filter(|_| complete_notice.is_none())
+    {
+        let last_field = copyright_index.max(identifier_index);
+        if header[first_index.expect("matched header")..=last_field]
+            .iter()
+            .any(|line| {
+                !line.trim_end_matches('\n').is_empty()
+                    && !is_copyright(line)
+                    && !line.starts_with("SPDX-License-Identifier:")
+            })
+            || header
+                .get(last_field + 1)
+                .is_some_and(|line| !line.trim_end_matches('\n').is_empty())
+            || (block
+                && header[last_field + 1..]
+                    .iter()
+                    .any(|line| !line.trim_end_matches('\n').is_empty()))
+        {
+            return problem(
+                display_path,
+                line_index + 1,
+                "LMH006",
+                "mixed or ambiguous license declarations",
+            );
+        }
+    }
+    if !spdx
+        && !header
+            .get(copyright_index + 1)
+            .is_some_and(|line| line.trim_end_matches('\n').is_empty())
+    {
+        return problem(
+            display_path,
+            line_index + 2,
+            "LMH006",
+            "expected one blank line between copyright and license notice",
+        );
+    }
+    let notice_matches = if spdx {
+        identifiers.len() == 1
+            && (policy.license_notices.iter().any(|notice| {
+                notice.starts_with("SPDX-License-Identifier:")
+                    && notice.trim_end_matches('\n') == identifiers[0].1.trim_end_matches('\n')
+            }) || complete_notice.is_some_and(|notice| {
+                notice
+                    .lines()
+                    .any(|line| line == identifiers[0].1.trim_end_matches('\n'))
+            }))
+    } else {
+        prose_notice.is_some()
+    };
+    if !notice_matches {
+        return problem(
+            display_path,
+            if spdx {
+                identifiers.first().map_or(line_index + 2, |(index, _)| {
+                    (if block { comments[0].0 } else { header_index }) + index + 1
+                })
+            } else {
+                line_index + 3
+            },
             "LMH005",
             "missing or mismatched license notice",
         );
@@ -528,16 +973,13 @@ pub(crate) fn inspect(raw: &[u8], policy: &HeaderPolicy, display_path: &str) -> 
         ),
     );
     // Splice only the ASCII year bytes. The original encoding, preamble and body stay untouched.
-    let needle = format!(
-        "{} Copyright (C) {}, ",
-        language.comment(),
-        &captures["years"]
-    );
+    let years = captures.name("years").expect("matched years");
+    let needle = &copyright_text[..years.end()];
     let raw_lines: Vec<&[u8]> = raw
         .split_inclusive(|byte| *byte == b'\n')
-        .take(*line_index + 1)
+        .take(line_index + 1)
         .collect();
-    if let Some(raw_line) = raw_lines.get(*line_index) {
+    if let Some(raw_line) = raw_lines.get(line_index) {
         let offsets: Vec<usize> = raw_line
             .windows(needle.len())
             .enumerate()
@@ -547,16 +989,15 @@ pub(crate) fn inspect(raw: &[u8], policy: &HeaderPolicy, display_path: &str) -> 
             && (1000..=9999).contains(&start_year)
             && (1000..=9999).contains(&policy.current_year)
         {
-            let year_start = raw_lines[..*line_index]
+            let year_start = raw_lines[..line_index]
                 .iter()
                 .map(|line| line.len())
                 .sum::<usize>()
                 + offsets[0]
-                + language.comment().len()
-                + b" Copyright (C) ".len();
-            // Only digits/a hyphen change inside the single validated line comment.
+                + years.start();
+            // Only digits/a hyphen change inside the single validated copyright field.
             // All supported encodings preserve ASCII, so syntax and other header fields stay valid.
-            result.edit = Some(YearEdit {
+            result.edit = Some(Edit::Year {
                 range: year_start..year_start + captures["years"].len(),
                 start: start_year,
                 end: policy.current_year,
@@ -580,6 +1021,7 @@ mod tests {
             owner: "Example Owner".into(),
             starting_year: 2022,
             current_year: 2030,
+            creation_year: None,
             license_notices: vec!["License notice.\n".into()],
             expected_header: String::new(),
         }
@@ -589,8 +1031,379 @@ mod tests {
         format!("# Copyright (C) {years}, Example Owner.\n\n# License notice.\n\nvalue = 'café'\n")
     }
 
+    #[test]
+    fn missing_headers_use_declared_years_and_preserve_preambles_and_bodies() {
+        let mut insertion = policy();
+        insertion.creation_year = Some(2024);
+        for (path, prefix, body) in [
+            ("file.py", "", "value = 'café'\n"),
+            (
+                "script.py",
+                "#!/usr/bin/env python3\n# coding: utf-8\n",
+                "value = 1\n",
+            ),
+            (
+                "file.js",
+                "#!/usr/bin/env node\n\n",
+                "'use strict';\nconst value = 1;\n",
+            ),
+            ("file.ts", "", "const value: number = 1;\n"),
+            ("file.rs", "", "#![no_std]\nconst VALUE: i32 = 1;\n"),
+            (
+                "file.go",
+                "//go:build linux\n// +build linux\n\n",
+                "package example\n",
+            ),
+            (
+                "Package.swift",
+                "// swift-tools-version: 6.0\n",
+                "import PackageDescription\n",
+            ),
+            ("script.sh", "#!/bin/bash\n", "printf '%s\\n' café\n"),
+            ("file.c", "", "#pragma once\nint value = 1;\n"),
+            ("file.cpp", "", "#include <vector>\nint value = 1;\n"),
+        ] {
+            let raw = format!("\u{feff}{prefix}{body}")
+                .replace('\n', "\r\n")
+                .into_bytes();
+            let result = analyze(&raw, &insertion, path);
+            assert!(result.diagnostic.as_ref().unwrap().fixable, "{path}");
+            let language = Language::from_path(std::path::Path::new(path)).unwrap();
+            let generated = render_header(
+                "Copyright (C) 2024-2030, Example Owner.\n\nLicense notice.\n\n",
+                language,
+            )
+            .replace('\n', "\r\n");
+            let gap = if prefix.is_empty() || prefix.ends_with("\n\n") {
+                ""
+            } else {
+                "\r\n"
+            };
+            let expected = format!(
+                "\u{feff}{}{gap}{generated}{}",
+                prefix.replace('\n', "\r\n"),
+                body.replace('\n', "\r\n")
+            );
+            let fixed = result.replacement.unwrap();
+            assert_eq!(fixed, expected.as_bytes(), "{path}");
+            assert!(
+                analyze(&fixed, &insertion, path).diagnostic.is_none(),
+                "{path}"
+            );
+        }
+        for raw in [b"".as_slice(), b"#!/bin/sh"] {
+            let fixed = analyze(raw, &insertion, "empty.sh").replacement.unwrap();
+            assert!(fixed.starts_with(raw));
+            assert!(analyze(&fixed, &insertion, "empty.sh").diagnostic.is_none());
+        }
+    }
+
+    #[test]
+    fn missing_header_insertion_refuses_existing_legal_text_and_invalid_years() {
+        let mut insertion = policy();
+        insertion.creation_year = Some(2024);
+        for raw in [
+            "# copyright 2024 Other Owner\nvalue = 1\n",
+            "# © 2024 Other Owner\nvalue = 1\n",
+            "# (c) 2024 Other Owner\nvalue = 1\n",
+            "# All rights reserved.\nvalue = 1\n",
+            "# SPDX-License-Identifier: MIT\nvalue = 1\n",
+            "value = 1\n# Copyright 2024 Other Owner\n",
+            "f\"\"\"Copyright 2024 Other Owner\"\"\"\nvalue = 1\n",
+            "b\"\"\"Copyright 2024 Other Owner\"\"\"\nvalue = 1\n",
+            "\"\"\"Copyright 2024 Other Owner.\"\"\"\nvalue = 1\n",
+            "r'''Existing licence text.'''\nvalue = 1\n",
+            "(\"Copyright 2024 Other Owner\")\nvalue = 1\n",
+            "\"Copy\" \"right 2024 Other Owner\"\nvalue = 1\n",
+            "\"Copy\\x72ight 2024 Other Owner\"\nvalue = 1\n",
+            "b\"Copy\\x72ight 2024 Other Owner\"\nvalue = 1\n",
+            "f\"Copy\\x72ight 2024 Other Owner\"\nvalue = 1\n",
+            "\"Copy\" f\"\\x72ight 2024 Other Owner\"\nvalue = 1\n",
+            "b\"Copy\" b\"\\x72ight 2024 Other Owner\"\nvalue = 1\n",
+            "f\"{'Copy'}right 2024 Other Owner\"\nvalue = 1\n",
+            "\"Copy\" \\\n\"right 2024 Other Owner\"\nvalue = 1\n",
+        ] {
+            assert_refused(raw, &insertion, "file.py", "LMH001");
+        }
+        for (path, raw, code) in [
+            (
+                "file.c",
+                "/* (C) 2024 Other Owner */\nint value = 1;\n",
+                "LMH001",
+            ),
+            (
+                "file.c",
+                "/* Licensed to Other Owner. */\nint value = 1;\n",
+                "LMH001",
+            ),
+            (
+                "file.rs",
+                "#![no_std]\n// Copyright 2024 Other Owner\n",
+                "LMH001",
+            ),
+            ("file.cpp", "/* unfinished\nint value = 1;\n", "LMH006"),
+        ] {
+            assert_refused(raw, &insertion, path, code);
+        }
+        for year in [999, 2021, 2031, 10000] {
+            insertion.creation_year = Some(year);
+            assert_refused("value = 1\n", &insertion, "file.py", "LMH001");
+        }
+        insertion.creation_year = Some(2024);
+        for (path, raw) in [
+            ("file.py", "\"\"\"A useful module.\"\"\"\nvalue = 1\n"),
+            ("file.c", "int f(int c) { if (c) return 2024; return 0; }\n"),
+        ] {
+            assert!(
+                analyze(raw.as_bytes(), &insertion, path)
+                    .replacement
+                    .is_some()
+            );
+        }
+        insertion.owner.push('\0');
+        assert_refused("value = 1\n", &insertion, "file.py", "LMH001");
+    }
+
+    #[test]
+    fn inserted_headers_keep_python_encodings_and_refuse_unrepresentable_notices() {
+        let mut insertion = policy();
+        insertion.creation_year = Some(2030);
+        for (label, owner, body) in [
+            ("latin-1", "Café Owner", b"value = '\xe9'\r\n".as_slice()),
+            ("cp1252", "€ Owner", b"value = '\x80'\r\n".as_slice()),
+            ("ascii", "Plain Owner", b"value = 1\r\n".as_slice()),
+        ] {
+            insertion.owner = owner.into();
+            let prefix = format!("#!/usr/bin/python\r\n# coding: {label}\r\n").into_bytes();
+            let raw = [prefix.as_slice(), body].concat();
+            let fixed = analyze(&raw, &insertion, "encoded.py").replacement.unwrap();
+            assert!(fixed.starts_with(&prefix));
+            assert!(fixed.ends_with(body));
+            assert!(
+                analyze(&fixed, &insertion, "encoded.py")
+                    .diagnostic
+                    .is_none()
+            );
+        }
+        insertion.owner = "Unicode € Owner".into();
+        for label in ["ascii", "latin-1"] {
+            let raw = format!("# coding: {label}\nvalue = 1\n");
+            assert!(
+                analyze(raw.as_bytes(), &insertion, "encoded.py")
+                    .replacement
+                    .is_none()
+            );
+        }
+    }
+
     fn inspect(source: impl AsRef<[u8]>) -> ContentAnalysis {
         analyze(source.as_ref(), &policy(), "x.py")
+    }
+
+    fn assert_year_fix(raw: &str, policy: &HeaderPolicy, path: &str) {
+        let result = analyze(raw.as_bytes(), policy, path);
+        assert_eq!(result.diagnostic.unwrap().code, "LMH004", "{path}: {raw:?}");
+        let fixed = result.replacement.unwrap();
+        assert_eq!(
+            fixed,
+            raw.replacen("2024", "2024-2030", 1).as_bytes(),
+            "{path}: {raw:?}"
+        );
+        assert!(
+            analyze(&fixed, policy, path).diagnostic.is_none(),
+            "{path}: {raw:?}"
+        );
+    }
+
+    fn assert_refused(raw: &str, policy: &HeaderPolicy, path: &str, code: &str) {
+        let result = analyze(raw.as_bytes(), policy, path);
+        let diagnostic = result.diagnostic.unwrap();
+        assert_eq!(diagnostic.code, code, "{path}: {raw:?}");
+        assert!(
+            !diagnostic.fixable && result.replacement.is_none(),
+            "{path}: {raw:?}"
+        );
+    }
+
+    #[test]
+    fn common_prose_and_spdx_layouts_preserve_every_byte_except_the_year() {
+        let mut policy = policy();
+        policy
+            .license_notices
+            .push("SPDX-License-Identifier: Apache-2.0\n".into());
+        for path in [
+            "x.py", "x.js", "x.ts", "x.rs", "x.go", "x.swift", "x.sh", "x.c", "x.cpp",
+        ] {
+            let language = Language::from_path(std::path::Path::new(path)).unwrap();
+            let preamble = match language {
+                Language::Python => "#!/usr/bin/env python3\n# coding: utf-8\n\n",
+                Language::Javascript | Language::Typescript => "#!/usr/bin/env node\n\n",
+                Language::Rust => "#!/usr/bin/env rust-script\n\n",
+                Language::Go => "//go:build linux\n\n",
+                Language::Swift => "// swift-tools-version: 5.9\n\n",
+                Language::Bash => "#!/usr/bin/env bash\n\n",
+                _ => "",
+            };
+            for copyright in [
+                "Copyright (C) 2024, Example Owner.",
+                "Copyright (c) 2024 Example Owner",
+                "Copyright 2024 Example Owner",
+                "SPDX-FileCopyrightText: 2024 Example Owner",
+            ] {
+                let mut headers = vec![format!(
+                    "{copyright}\n\nSPDX-License-Identifier: Apache-2.0\n"
+                )];
+                if copyright.starts_with("SPDX-") {
+                    headers.extend([
+                        format!("{copyright}\nSPDX-License-Identifier: Apache-2.0\n"),
+                        format!("SPDX-License-Identifier: Apache-2.0\n{copyright}\n"),
+                    ]);
+                } else {
+                    headers.extend([
+                        format!("{copyright}\n\nLicense notice.\n"),
+                        format!("{copyright}\n\nLicense notice.\n\nSPDX-License-Identifier: Apache-2.0\n"),
+                    ]);
+                }
+                for text in headers {
+                    let mut layouts = vec![render_header(&text, language)];
+                    if language.comment() == "//" {
+                        let starred = text
+                            .lines()
+                            .map(|line| format!(" * {line}\n"))
+                            .collect::<String>();
+                        layouts.extend([
+                            format!("/*\n{starred} */\n"),
+                            format!("/* {text}*/\n"),
+                            format!("/*\n{} */\n", text.trim_end_matches('\n')),
+                        ]);
+                    }
+                    let notes = render_header(
+                        "Note: SPDX-License-Identifier: is a keyword; SPDX-License-Identifier: here is not a field.\n",
+                        language,
+                    );
+                    for layout in layouts {
+                        for suffix in [String::new(), format!("\n{notes}")] {
+                            for prefix in ["", preamble] {
+                                for newline in ["\n", "\r\n"] {
+                                    let raw = format!("\u{feff}{prefix}{layout}{suffix}\nbody = \"2024 Copyright Example Owner\"\n").replace('\n', newline);
+                                    assert_year_fix(&raw, &policy, path);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            for notice in [
+                "License notice mentions SPDX-License-Identifier: twice: SPDX-License-Identifier:.\n",
+                "SPDX-License-Identifier: Apache-2.0\nSee LICENSE for full terms.\n",
+            ] {
+                let mut custom = policy.clone();
+                custom.license_notices = vec![notice.into()];
+                let raw = render_header(
+                    &format!("Copyright 2024 Example Owner\n\n{notice}"),
+                    language,
+                );
+                assert_year_fix(&raw, &custom, path);
+            }
+        }
+    }
+
+    #[test]
+    fn ambiguous_spdx_and_block_headers_never_offer_repairs() {
+        let mut policy = policy();
+        policy
+            .license_notices
+            .push("SPDX-License-Identifier: Apache-2.0\n".into());
+        let spdx =
+            "SPDX-FileCopyrightText: 2024 Example Owner\nSPDX-License-Identifier: Apache-2.0\n";
+        let prose = "Copyright 2024 Example Owner\n\nLicense notice.\n";
+        for path in [
+            "x.py", "x.js", "x.ts", "x.rs", "x.go", "x.swift", "x.sh", "x.c", "x.cpp",
+        ] {
+            let language = Language::from_path(std::path::Path::new(path)).unwrap();
+            let marker = language.comment();
+            let header = render_header(spdx, language);
+            for (raw, code) in [
+                (header.replace("Example Owner", "Other Owner"), "LMH002"),
+                (header.replace("2024", "2031"), "LMH003"),
+                (header.replace("2024", "20x4"), "LMH006"),
+                (header.replace("Apache-2.0", "MIT"), "LMH005"),
+                (header.replace("Apache-2.0", "Apache-2.0 OR MIT"), "LMH005"),
+                (
+                    render_header(
+                        &format!("{prose}\nSPDX-License-Identifier: MIT\n"),
+                        language,
+                    ),
+                    "LMH005",
+                ),
+                (format!("{header}{header}"), "LMH006"),
+                (
+                    render_header(
+                        &spdx.replace(
+                            "SPDX-License-Identifier:",
+                            "Wrong notice.\nSPDX-License-Identifier:",
+                        ),
+                        language,
+                    ),
+                    "LMH006",
+                ),
+                (
+                    format!("{header}{marker} SPDX-FileCopyrightText: 2024 Other Owner\n"),
+                    "LMH006",
+                ),
+                (
+                    format!("{header}{marker} SPDX-License-Identifier: Apache-2.0\n"),
+                    "LMH006",
+                ),
+                (header.replace('\n', "\r"), "LMH006"),
+                (format!("code\n{header}"), "LMH001"),
+                (
+                    format!("{marker} SPDX-FileCopyrightText: 2024 Example Owner\n"),
+                    "LMH005",
+                ),
+            ] {
+                assert_refused(&raw, &policy, path, code);
+            }
+            for notice in [
+                "This program is licensed under the MIT License.",
+                "Licensed under the MIT License.",
+                "This file is licensed under the MIT License.",
+                "License: MIT",
+                "Released under the MIT licence.",
+            ] {
+                for year in ["2024", "2030"] {
+                    let raw = format!("{header}\n{marker} {notice}\n").replacen("2024", year, 1);
+                    assert_refused(&raw, &policy, path, "LMH006");
+                }
+                if marker == "//" {
+                    for raw in [
+                        format!("{header}\n/* {notice} */\n"),
+                        format!("/*\n{spdx}*/\n// {notice}\n"),
+                        format!("/*\n{spdx}*/\n\n// {notice}\n"),
+                        format!("/*\n{prose}*/ /* {notice} */\n"),
+                        format!("/*\n{prose}{notice}\n*/\n"),
+                    ] {
+                        assert_refused(&raw, &policy, path, "LMH006");
+                    }
+                }
+            }
+            if marker == "//" {
+                for raw in [
+                    format!("{header}/// SPDX-FileCopyrightText: 2024 Other Owner\n"),
+                    "/* SPDX-License-Identifier: Apache-2.0\n * an example Copyright line\n*/\n".into(),
+                    "/* Copyright (C) 2024, Example Owner.\n\nLicense notice.\n/* nested */\n*/\n".into(),
+                    "/*\nCopyright 2024 Example Owner\n\nWrong notice.\nSPDX-License-Identifier: Apache-2.0\n*/\n".into(),
+                    "/*\nCopyright 2024 Example Owner\nSPDX-License-Identifier: Apache-2.0\nWrong notice.\n*/\n".into(),
+                    format!("/*\n{prose}*/\n// SPDX-License-Identifier: MIT\n"),
+                    format!("/*\n{spdx}"),
+                    format!("/*\n{} */ /* Licensed under the MIT License. */\n", spdx.trim_end_matches('\n')),
+                    format!("/**\n{spdx}*/\n"),
+                    format!("/*!\n{spdx}*/\n"),
+                ] {
+                    assert_refused(&raw, &policy, path, "LMH006");
+                }
+            }
+        }
     }
 
     #[test]

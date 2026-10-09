@@ -125,8 +125,8 @@ A 2026 refresh produces a diff like this:
 +# Copyright (C) 2024-2026, Example Organization.
 ```
 
-Only the end year changes. `check` never writes source files. Missing headers and other
-findings stay available for manual review. See the
+Only the end year changes. `check` never writes source files. Without a declared
+creation year, missing headers stay available for manual review. See the
 [getting-started guide](docs/getting-started.md) for a complete header example.
 
 ## Benchmarks
@@ -137,6 +137,23 @@ a locally measured comparison or `--baseline /path/to/previous/lmh` to show the
 improvement. See [requirements and reproduction](docs/benchmarks.md#reproduce).
 
 ## Configuration and safety
+
+### Insert missing headers (unreleased)
+
+The source checkout can insert your configured owner and notice. Declare the
+actual first copyright year for the selected files:
+
+```shell
+lmh fix --creation-year 2024 src/new_file.py
+lmh check src/new_file.py
+git diff
+```
+
+`creation-year` may also be configured; `starting-year` remains a validation
+floor. Insertion preserves existing bytes, encoding, preambles, and mode.
+Legal markers and unsafe or ambiguous files require review. See the
+[insertion rules](docs/getting-started.md#insert-a-missing-header-unreleased).
+Published 0.7.0 does not include this feature.
 
 Keep the policy in the file your project already uses:
 
@@ -163,14 +180,29 @@ paths are relative to the invocation directory. Unsupported extensions are skipp
 Exclude generated, dependency, and build folders with `ignore-folders`; LMH does not
 infer exclusions from `.gitignore`.
 
-Repairs require one recognized stale year for the configured owner. Ambiguous layouts,
+Published 0.7.0 repairs require one recognized stale year for the configured owner. Ambiguous layouts,
 wrong owners, future years, unsupported encodings, symlinks/reparse points, multiple hard
 links, and concurrently changed targets are refused. Ownership and licensing always
-come from your policy; LMH does not insert missing headers or establish legal, SPDX, or
+come from your policy; published 0.7.0 does not insert missing headers or establish legal, SPDX, or
 REUSE compliance.
 
 See the [configuration guide](docs/configuration.md) for all options, language aliases,
 supported extensions, notice formats, and byte-preservation rules.
+
+## Additional header layouts (unreleased)
+
+The source checkout also accepts common `Copyright` lines, ordinary `/* ... */`
+headers, and SPDX copyright/license pairs. These layouts are not supported by
+the published **0.7.0** release. See the
+[header layout guide](docs/configuration.md#additional-layouts-unreleased) for
+examples and limits. Existing-header repairs still change only one recognized stale year.
+
+```c
+/*
+ * SPDX-FileCopyrightText: 2024-2026 Example Organization
+ * SPDX-License-Identifier: Apache-2.0
+ */
+```
 
 ## Agents and JSON
 
@@ -369,7 +401,7 @@ jobs:
             --body "Annual refresh of recognized Python copyright years using the declared header policy."
 ```
 
-The external UV environment keeps installed dependency files outside the scan and PR. Repairs follow `[tool.lint-my-headers]` paths/exclusions and update only recognized stale years for its declared owner in supported Python files. They preserve creation years and all other bytes/modes. Missing, ambiguous, unsafe, or wrong-owner notices require manual review; a failed repair stops before any branch or PR is published. To cover more Python source files, extend the declared paths while preserving generated/vendor exclusions. This annual workflow stages Python changes only.
+The external UV environment keeps installed dependency files outside the scan and PR. Repairs follow `[tool.lint-my-headers]` paths/exclusions and refresh recognized stale years for its declared owner in supported Python files. Leave `creation-year` unset for this year-only workflow. Missing, ambiguous, unsafe, or wrong-owner notices then require manual review; a failed repair stops before any branch or PR is published. Existing source bytes and modes are preserved. To cover more Python source files, extend the declared paths while preserving generated/vendor exclusions. This annual workflow stages Python changes only.
 
 Each year gets one `automation/update-copyright-years-YYYY` branch. Existing PRs, including closed PRs, are left untouched; reopen the existing PR if it was closed by mistake. If a push succeeded but PR creation failed, rerunning resumes PR creation from that branch without overwriting it. If repairs make no changes and no annual branch already exists, no PR is created. Only tracked Python changes are committed; generated untracked files are excluded. Pushes never target the default branch or force-update an existing branch.
 
