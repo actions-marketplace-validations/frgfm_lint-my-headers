@@ -7,8 +7,8 @@
 <h1 align="center">Lint My Headers</h1>
 
 <p align="center">
-  <strong>Fast copyright and license header checks, powered by Rust.</strong><br>
-  One policy for your codebase. Clear findings. Small, reviewable repairs.
+  <strong>Check copyright and license headers across nine languages.</strong><br>
+  Refresh stale years with small, reviewable changes.
 </p>
 
 <p align="center">
@@ -24,9 +24,9 @@
   <a href="https://github.com/frgfm/lint-my-headers/releases"><strong>Releases</strong></a>
 </p>
 
-Keep copyright and license notices consistent across your codebase, and turn an annual
-refresh into a small diff. Run `lmh` locally, in CI, or from a coding agent using the
-same explicit policy.
+For maintainers who already keep copyright and license headers in their source files.
+Declare the owner, license, and languages in one policy. Run `lmh` locally, in CI,
+or from a coding agent. Review each finding and each proposed year update.
 
 ## Highlights
 
@@ -41,36 +41,62 @@ same explicit policy.
 - **Fits your workflow.** First-party pre-commit/prek hook, GitHub Action, and stable JSON
   diagnostics for scripts and coding agents.
 
+## Compare header tools
+
+Choose by the checks and edits your project needs:
+
+| Tool | Check | Edits | Implementation |
+| --- | --- | --- | --- |
+| **Lint My Headers** | Declared owner, years, and notice. | One eligible end year; missing headers with a declared creation year. | Native Rust. |
+| [HawkEye](https://github.com/fast/hawkeye) | Header template. | Insert, rewrite, remove. | Native Rust. |
+| [addlicense](https://github.com/google/addlicense) | Header presence. | Insert missing headers. | Native Go. |
+| [License Eye](https://github.com/apache/skywalking-eyes) | Headers and dependency licenses. | Insert or rewrite; dependency summaries. | Native Go. |
+| [REUSE](https://reuse.software/tutorial/) | Per-file declarations and license texts. | Annotate copyright and licensing. | Python. |
+| [licenseheaders](https://github.com/johann-petrak/licenseheaders) | Edit dry run; no dedicated checker. | Templates or year fields. | Python. |
+| [NWA](https://github.com/B1NARY-GR0UP/nwa) | Header template. | Insert, rewrite, remove. | Native Go. |
+
+LMH 0.8.0 keeps the creation year, other bytes, and file mode. Missing-header
+insertion requires an explicit creation year, owner, and notice. It does not inspect
+dependency licenses or check the REUSE convention. The
+[full comparison](docs/comparison.md) covers SPDX/JSON support,
+behavior tests, runtime requirements, installation steps, and measured disk use.
+
 ## Performance
 
-On **10,000 mixed-language files** (1 KiB/file), the release CLI measured:
+Fresh CLI checks on **1 KiB Python files**, measured on an **Apple M3 Pro,
+macOS 15.7.7, APFS**. Seven trials after warmup; median latency and derived
+bulk throughput. Peak RSS is the highest process memory seen in seven separate
+10,000-file runs. The LMH measurements use the published **0.7.0** wheel;
+they have not been rerun for 0.8.0.
 
-| Task | LMH | HawkEye 7.2.0 |
-| --- | ---: | ---: |
-| Routine check | 36 ms | 76 ms |
-| Check stale headers | 62 ms | 76 ms |
-| Repair stale years | 147 ms | 125 ms |
+| Tool / check scope | 10 files | 10,000 files | Bulk files/s | Peak RSS |
+| --- | ---: | ---: | ---: | ---: |
+| LMH 0.7.0 / Policy | 4.7 ms | 153.9 ms | 64,972 | 16.0 MiB |
+| HawkEye 7.2.0 / Template | 3.8 ms | 243.9 ms | 40,997 | 6.9 MiB |
+| License Eye 0.9.0 / Template | 19.5 ms | 2339.7 ms | 4,274 | 61.7 MiB |
+| NWA 0.8.0 / Template | 5.2 ms | 624.5 ms | 16,014 | 49.7 MiB |
+| addlicense 1.2.0 / Presence | 3.0 ms | 424.6 ms | 23,551 | 24.0 MiB |
+| REUSE 6.2.0 / REUSE audit | 333.0 ms | 811.0 ms | 12,331 | 98.8 MiB |
 
-Five timing trials after warmup on the same shared Linux runner. Both tools receive
-the same CPU budget; LMH uses up to four available workers for large trees.
+These commands do different work. addlicense checks presence; REUSE also checks
+declarations and license texts. REUSE's RSS does not sum its parallel workers.
+Compiler names alone do not predict speed. Hook setup and cold storage are excluded.
 
-![Native check latency](https://github.com/user-attachments/assets/6bee81a7-b77a-4614-915f-b10582d43117)
-
-See the [performance guide](docs/benchmarks.md) for repair time, peak memory,
-all nine languages, CSVs, methodology and reproduction. These are synthetic,
-warm-cache results; CPU limits and storage affect the comparison.
+See the [comparison method, ranges and raw samples](docs/comparison.md#latency-throughput-and-memory).
+The [earlier Linux performance guide](docs/benchmarks.md) separately covers
+nine languages, stale-header checks and year repairs.
 
 ## Installation
 
 Install the published release with [uv](https://docs.astral.sh/uv/):
 
 ```shell
-uv tool install lint-my-headers==0.7.0
+uv tool install lint-my-headers==0.8.0
 ```
 
-Or install with pip: `python -m pip install lint-my-headers==0.7.0`.
+Or install with pip: `python -m pip install lint-my-headers==0.8.0`.
 
-Version **0.7.0** supports all nine languages and policy in `.lmh.toml`,
+Version **0.8.0** supports all nine languages and policy in `.lmh.toml`,
 `pyproject.toml`, `Cargo.toml`, or `package.json`. Select your project's languages
 in the policy; the default remains Python.
 
@@ -138,9 +164,9 @@ improvement. See [requirements and reproduction](docs/benchmarks.md#reproduce).
 
 ## Configuration and safety
 
-### Insert missing headers (unreleased)
+### Insert missing headers
 
-The source checkout can insert your configured owner and notice. Declare the
+Version 0.8.0 can insert your configured owner and notice. Declare the
 actual first copyright year for the selected files:
 
 ```shell
@@ -152,8 +178,7 @@ git diff
 `creation-year` may also be configured; `starting-year` remains a validation
 floor. Insertion preserves existing bytes, encoding, preambles, and mode.
 Legal markers and unsafe or ambiguous files require review. See the
-[insertion rules](docs/getting-started.md#insert-a-missing-header-unreleased).
-Published 0.7.0 does not include this feature.
+[insertion rules](docs/getting-started.md#insert-a-missing-header).
 
 Keep the policy in the file your project already uses:
 
@@ -180,21 +205,20 @@ paths are relative to the invocation directory. Unsupported extensions are skipp
 Exclude generated, dependency, and build folders with `ignore-folders`; LMH does not
 infer exclusions from `.gitignore`.
 
-Published 0.7.0 repairs require one recognized stale year for the configured owner. Ambiguous layouts,
+Existing-header repairs require one recognized stale year for the configured owner. Ambiguous layouts,
 wrong owners, future years, unsupported encodings, symlinks/reparse points, multiple hard
 links, and concurrently changed targets are refused. Ownership and licensing always
-come from your policy; published 0.7.0 does not insert missing headers or establish legal, SPDX, or
-REUSE compliance.
+come from your policy. Missing-header insertion also requires a declared creation year.
+LMH does not establish legal, SPDX, or REUSE compliance.
 
 See the [configuration guide](docs/configuration.md) for all options, language aliases,
 supported extensions, notice formats, and byte-preservation rules.
 
-## Additional header layouts (unreleased)
+## Additional header layouts
 
-The source checkout also accepts common `Copyright` lines, ordinary `/* ... */`
-headers, and SPDX copyright/license pairs. These layouts are not supported by
-the published **0.7.0** release. See the
-[header layout guide](docs/configuration.md#additional-layouts-unreleased) for
+Version **0.8.0** accepts common `Copyright` lines, ordinary `/* ... */`
+headers, and single-owner SPDX copyright/license pairs. See the
+[header layout guide](docs/configuration.md#additional-layouts) for
 examples and limits. Existing-header repairs still change only one recognized stale year.
 
 ```c
@@ -241,14 +265,13 @@ your project's `languages` in its policy:
 ```yaml
 repos:
   - repo: https://github.com/frgfm/lint-my-headers
-    rev: <reviewed-commit-with-lmh-wheel>
+    rev: v0.8.0
     hooks:
       - id: lmh-wheel
 ```
 
-This hook is available on `main` and will ship in the next release. Replace the
-placeholder with a reviewed commit that contains it; `v0.7.0` has only the source
-hook. uv manages Python 3.11+ and caches the installed wheel for later runs.
+The `lmh-wheel` hook is included in 0.8.0. uv manages Python 3.11+ and caches
+the installed wheel for later runs.
 Source builds are disabled, so an unavailable wheel fails without compiling Rust.
 
 Use the published native wheel in an isolated Python 3.11+ hook environment.
@@ -265,7 +288,7 @@ repos:
         types: [file]
         additional_dependencies:
           - --only-binary=lint-my-headers
-          - lint-my-headers==0.7.0
+          - lint-my-headers==0.8.0
 ```
 
 Alternatively, use the first-party source hook at the release tag:
@@ -273,7 +296,7 @@ Alternatively, use the first-party source hook at the release tag:
 ```yaml
 repos:
   - repo: https://github.com/frgfm/lint-my-headers
-    rev: v0.7.0
+    rev: v0.8.0
     hooks:
       - id: lmh
 ```
@@ -288,12 +311,12 @@ Add the published release to your existing workflow:
 ```yaml
 steps:
   - uses: actions/checkout@v7
-  - uses: frgfm/lint-my-headers@v0.7.0
+  - uses: frgfm/lint-my-headers@v0.8.0
 ```
 
 The Action reads repository policy and uses uv to install the exact PyPI version with
 source builds disabled. Prefer immutable release SHAs; the
-[v0.7.0 release notes](https://github.com/frgfm/lint-my-headers/releases/tag/v0.7.0)
+[v0.8.0 release notes](https://github.com/frgfm/lint-my-headers/releases/tag/v0.8.0)
 provide its commit SHA. For an unreleased multilingual revision, pin its reviewed SHA
 and set `version: source` to build that Action checkout using `Cargo.lock`.
 
@@ -316,7 +339,7 @@ First, declare LMH in your project's quality dependencies, then add a `headers-f
 
 ```toml
 [dependency-groups]
-quality = ["lint-my-headers==0.7.0"]
+quality = ["lint-my-headers==0.8.0"]
 ```
 
 Run `uv lock` and commit the updated `uv.lock`, then add:
@@ -423,7 +446,8 @@ For a failed scheduled run, fix the cause and use **Actions → Re-run failed jo
 Lint My Headers is open source under [Apache-2.0](LICENSE). Contributions, bug reports,
 and feedback are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for local development
 and checks, [AGENTS.md](AGENTS.md) for runtime contracts, and
-[RELEASE_NOTES.md](RELEASE_NOTES.md) for release and migration notes.
+[GitHub Releases](https://github.com/frgfm/lint-my-headers/releases) for release
+and migration notes.
 
 [Report a bug](https://github.com/frgfm/lint-my-headers/issues) ·
 [Read the docs](https://docs.fgfm.dev/lint-my-headers/) ·

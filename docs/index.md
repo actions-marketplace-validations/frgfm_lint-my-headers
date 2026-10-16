@@ -1,12 +1,15 @@
 ---
-description: A Rust CLI for checking source copyright and license headers and safely refreshing recognized stale years.
+description: Check copyright and license headers across nine languages. Refresh stale years with small, reviewable changes.
 ---
 
 # Lint My Headers
 
-Check source copyright and license headers across nine languages. Declare your
-policy, find issues, and refresh recognized stale years while preserving
-everything else.
+Check copyright and license headers across nine languages. Refresh stale years
+with small, reviewable changes.
+
+For maintainers who already keep headers in their source files. Declare the
+owner, license, and languages in one policy. Run a read-only check, review the
+findings, and update eligible stale years.
 
 ## What it does
 
@@ -14,13 +17,14 @@ everything else.
   and C++.
 - **Read-only checks:** `lmh check` reports what needs attention without writing
   source files.
-- **Year-only repairs:** `lmh fix` updates one recognized stale year for your
-  configured owner.
+- **Limited repairs:** `lmh fix` updates one recognized stale year for your
+  configured owner, or inserts a missing header with a declared creation year.
 
-!!! info "Multilingual release"
+!!! info "Version 0.8.0"
 
-    Version 0.7.0 provides all nine languages through native PyPI wheels. Select
-    `languages` in your policy; the default is Python. See the
+    Missing-header insertion, additional header layouts, and the wheel hook join
+    all nine supported languages. Select `languages` in your policy; the default
+    is Python. See the
     [installation options](getting-started.md#install).
 
 ## One year, one small diff
@@ -46,6 +50,8 @@ The creation year, owner, and every other byte stay intact.
 
 ## Documentation
 
+- [Compare header tools](comparison.md): compare features, check latency,
+  throughput, memory, disk use, and installation steps.
 - [Getting started](getting-started.md): install the CLI, declare a first policy,
   and check your existing headers.
 - [Configuration](configuration.md): configuration files, language selectors, and
@@ -65,9 +71,8 @@ Missing headers without a creation year, wrong owners, malformed notices, and
 future years require manual review.
 
 Ownership and licensing always come from your declared policy. Lint My Headers
-does not establish legal, SPDX, or REUSE compliance. Published 0.7.0 does not
-insert missing headers. The unreleased source can
-[insert a missing header with a declared creation year](getting-started.md#insert-a-missing-header-unreleased).
+does not establish legal, SPDX, or REUSE compliance. Version 0.8.0 can
+[insert a missing header with a declared creation year](getting-started.md#insert-a-missing-header).
 Both `lmh` and `lint-my-headers` expose the same commands, with no language
 toolchain or Node.js runtime needed by the installed native CLI.
 
