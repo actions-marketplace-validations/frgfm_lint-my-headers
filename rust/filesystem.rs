@@ -1,8 +1,10 @@
 use crate::model::{Language, Settings};
+use ignore::WalkBuilder;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, Metadata, Permissions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 #[cfg(unix)]
@@ -18,30 +20,81 @@ fn linked(metadata: &Metadata) -> bool {
     metadata.file_type().is_symlink()
 }
 
-fn walk(root: &Path, candidates: &mut Vec<PathBuf>, ignored: &[PathBuf]) -> io::Result<()> {
+fn walk(
+    root: &Path,
+    candidates: &mut Vec<PathBuf>,
+    ignored: &[PathBuf],
+    respect_gitignore: bool,
+) -> io::Result<()> {
     let key = absolute_key(root)?;
     if ignored.iter().any(|folder| key.starts_with(folder)) {
         return Ok(());
     }
-    for entry in fs::read_dir(root)? {
-        let entry = entry?;
-        let path = entry.path();
+    let ignored = ignored.to_vec();
+    let filter_error = Arc::new(Mutex::new(None));
+    let reported_error = Arc::clone(&filter_error);
+    let mut builder = WalkBuilder::new(root);
+    builder
+        .standard_filters(false)
+        .hidden(false)
+        .parents(true)
+        .ignore(false)
+        .git_ignore(respect_gitignore)
+        .git_global(false)
+        .git_exclude(false)
+        .require_git(false)
+        .follow_links(false);
+    builder.filter_entry(move |entry| {
         #[cfg(windows)]
-        let metadata = fs::symlink_metadata(&path)?;
+        let is_link = match fs::symlink_metadata(entry.path()) {
+            Ok(metadata) => linked(&metadata),
+            Err(error) => {
+                if let Ok(mut slot) = reported_error.lock() {
+                    slot.get_or_insert(error);
+                }
+                return false;
+            }
+        };
         #[cfg(not(windows))]
-        let metadata = entry.file_type()?;
-        #[cfg(windows)]
-        let is_link = linked(&metadata);
-        #[cfg(not(windows))]
-        let is_link = metadata.is_symlink();
+        let is_link = entry.file_type().is_some_and(|kind| kind.is_symlink());
         if is_link {
+            return false;
+        }
+        if !entry.file_type().is_some_and(|kind| kind.is_dir()) {
+            return true;
+        }
+        let key = match absolute_key(entry.path()) {
+            Ok(key) => key,
+            Err(error) => {
+                if let Ok(mut slot) = reported_error.lock() {
+                    slot.get_or_insert(error);
+                }
+                return false;
+            }
+        };
+        if ignored.iter().any(|folder| key.starts_with(folder)) {
+            return false;
+        }
+        true
+    });
+    for entry in builder.build() {
+        let entry = entry.map_err(|error| io::Error::other(error.to_string()))?;
+        if let Some(error) = entry.error() {
+            return Err(io::Error::other(error.to_string()));
+        }
+        let Some(file_type) = entry.file_type() else {
             continue;
+        };
+        if file_type.is_file() && Language::from_path(entry.path()).is_some() {
+            candidates.push(entry.path().to_path_buf());
         }
-        if metadata.is_dir() {
-            walk(&path, candidates, ignored)?;
-        } else if metadata.is_file() && Language::from_path(&path).is_some() {
-            candidates.push(path);
-        }
+    }
+    if let Some(error) = filter_error
+        .lock()
+        .map_err(|_| io::Error::other("discovery filter lock was poisoned"))?
+        .take()
+    {
+        return Err(error);
     }
     Ok(())
 }
@@ -81,7 +134,13 @@ pub(crate) fn discover_unsorted(settings: &Settings) -> Result<Vec<PathBuf>, Str
                     path.display()
                 ));
             }
-            walk(path, &mut candidates, &ignored_folders).map_err(|error| error.to_string())?;
+            walk(
+                path,
+                &mut candidates,
+                &ignored_folders,
+                settings.respect_gitignore,
+            )
+            .map_err(|error| error.to_string())?;
         } else if metadata.is_file() {
             candidates.push(path.clone());
         } else {
@@ -386,6 +445,7 @@ mod tests {
             languages: vec![Language::Python],
             ignore_files: vec!["ignored.py".into()],
             ignore_folders: vec![root.join("skip")],
+            respect_gitignore: false,
             project_root: root.to_path_buf(),
             config_path: None,
         }
@@ -400,11 +460,13 @@ mod tests {
             "a.py",
             ".py",
             "other.txt",
+            "gitignored.py",
             "ignored.py",
             "skip/a.py",
         ] {
             fs::write(root.path().join(name), b"content").unwrap();
         }
+        fs::write(root.path().join(".gitignore"), "gitignored.py\n").unwrap();
         let mut settings = settings(root.path());
         settings.paths.push(root.path().join("./a.py"));
         #[cfg(unix)]
@@ -423,11 +485,48 @@ mod tests {
             vec![
                 root.path().join(".py"),
                 root.path().join("a.py"),
+                root.path().join("gitignored.py"),
                 root.path().join("z.py")
             ]
         );
         settings.ignore_folders.push(root.path().to_path_buf());
         assert!(discover(&settings).unwrap().is_empty());
+    }
+
+    #[test]
+    fn gitignore_respects_nested_rules_and_explicit_file_selection() {
+        let root = tempfile::tempdir().unwrap();
+        let nested = root.path().join("nested");
+        fs::create_dir(&nested).unwrap();
+        fs::write(root.path().join(".gitignore"), "*.py\n!.hidden.py\n").unwrap();
+        fs::write(nested.join(".gitignore"), "!keep.py\n").unwrap();
+        for name in ["ignored.py", ".hidden.py"] {
+            fs::write(root.path().join(name), b"source").unwrap();
+        }
+        for name in ["ignored.py", "keep.py"] {
+            fs::write(nested.join(name), b"source").unwrap();
+        }
+
+        let mut settings = settings(root.path());
+        settings.ignore_files.clear();
+        settings.ignore_folders.clear();
+        settings.respect_gitignore = true;
+        assert_eq!(
+            discover(&settings).unwrap(),
+            vec![root.path().join(".hidden.py"), nested.join("keep.py")]
+        );
+
+        settings.paths = vec![root.path().join("ignored.py")];
+        assert_eq!(
+            discover(&settings).unwrap(),
+            vec![root.path().join("ignored.py")]
+        );
+        settings.ignore_files.push("ignored.py".into());
+        assert!(discover(&settings).unwrap().is_empty());
+
+        settings.paths = vec![root.path().to_path_buf()];
+        fs::write(root.path().join(".gitignore"), "[z-a]\n").unwrap();
+        assert!(discover(&settings).is_err());
     }
 
     #[test]
