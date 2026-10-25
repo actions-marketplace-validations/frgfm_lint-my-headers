@@ -38,6 +38,26 @@ Install the published multilingual release or build the CLI from source.
     Ensure Cargo's binary directory is on your `PATH`. Python is optional when
     using the native CLI directly.
 
+=== "Without Python"
+
+    Download the [0.8.0 PyPI wheel](https://pypi.org/project/lint-my-headers/0.8.0/#files)
+    for your operating system and CPU; choose `musllinux` for Alpine. Wheels are
+    ZIP archives with both commands; verify their SHA-256 checksums against PyPI.
+    For Linux x86_64 with glibc 2.28+:
+
+    ```shell
+    wheel=lint_my_headers-0.8.0-py3-none-manylinux_2_28_x86_64.whl
+    unzip -q "$wheel" -d lmh-wheel
+    ./lmh-wheel/lint_my_headers-0.8.0.data/scripts/lmh --version
+    ```
+
+    On Windows, rename the matching `.whl` file to `.zip`, extract it, and run
+    `lmh.exe` from its `.data/scripts` directory. Keep the extracted directory
+    intact so it retains the bundled license. Add `scripts` to `PATH` if needed.
+
+    macOS may block browser-downloaded binaries. If blocked, use the published
+    release installation above rather than disabling Gatekeeper.
+
 ## Declare the policy
 
 Use your project's established ownership and license. These example values are
