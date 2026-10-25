@@ -1310,7 +1310,7 @@ fn custom_notices_require_text_and_match_complete_lines() {
 }
 
 #[test]
-fn invalid_config_is_rejected_before_any_write() {
+fn invalid_config_and_options_are_rejected_before_any_write() {
     let dir = workspace();
     let root = dir.path();
     let stale = header(year() - 2);
@@ -1371,6 +1371,7 @@ fn invalid_config_is_rejected_before_any_write() {
     write(root, "pyproject.toml", CONFIG);
     let future = (year() + 1).to_string();
     for args in [
+        vec!["fix", "--diff"],
         vec!["fix", "--folders", "src", "src/stale.py"],
         vec!["fix", "--license", "made-up-license"],
         vec!["fix", "--config", "missing.toml"],
@@ -1380,6 +1381,7 @@ fn invalid_config_is_rejected_before_any_write() {
     ] {
         assert_eq!(json_run(root, &args, 2)["changed"], json!([]));
     }
+    run(root, &["check", "--diff"], 2);
     let missing = json_run(root, &["check", "--config", "missing.toml"], 2);
     json_run(
         root,
@@ -1672,6 +1674,9 @@ fn symlinks_are_skipped_during_discovery_and_refused_during_fix() {
     let check = json_run(root, &["check", "src/link.py"], 1);
     assert_eq!(check["diagnostics"][0]["code"], "LMH004");
     assert_eq!(check["diagnostics"][0]["fixable"], false);
+    let preview = run(root, &["fix", "--diff", "src/link.py"], 1);
+    assert!(preview.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&preview.stderr).contains("src/link.py:1:1: LMH008"));
     let fixed = json_run(root, &["fix", "src/link.py"], 1);
     assert_eq!(fixed["diagnostics"][0]["code"], "LMH008");
     assert_eq!(fs::read_to_string(&target).unwrap(), stale);
@@ -1766,4 +1771,38 @@ fn pinned_spdx_data_accepts_every_legacy_notice_and_new_identifiers() {
             .unwrap()
             .starts_with(&format!("# Copyright (C) {}, {OWNER}.", year()))
     );
+}
+
+#[test]
+fn fix_diff_previews_repairs_without_writing() {
+    let dir = workspace();
+    let root = dir.path();
+    let first = year() - 2;
+    let stale = header(first);
+    let missing = "value = 1\n";
+    write(root, "src/stale.py", &stale);
+    write(root, "src/missing.py", missing);
+    let output = run(
+        &root.join("src"),
+        &["fix", "--diff", "--creation-year", &first.to_string(), "."],
+        1,
+    );
+    let diff = String::from_utf8_lossy(&output.stdout);
+    for name in ["stale", "missing"] {
+        assert!(diff.contains(&format!("--- a/src/{name}.py\n+++ b/src/{name}.py")));
+    }
+    let current_header = format!("+# Copyright (C) {first}-{}, {OWNER}.", year());
+    assert_eq!(diff.matches(&current_header).count(), 2);
+    assert!(diff.contains(&format!("-# Copyright (C) {first}, {OWNER}.")));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("LMH"));
+    assert_eq!(
+        fs::read_to_string(root.join("src/stale.py")).unwrap(),
+        stale
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("src/missing.py")).unwrap(),
+        missing
+    );
+    let io_error = run(root, &["fix", "--diff", "src/stale.py", "src/absent.py"], 2);
+    assert!(io_error.stdout.is_empty());
 }
