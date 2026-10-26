@@ -924,6 +924,7 @@ fn text_diagnostics_and_action_outputs_remain_compatible() {
     let output = run(root, &["check"], 1);
     assert!(output.stdout.is_empty());
     let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("Checked 2 files."));
     assert!(stderr.contains("src/stale.py:1:1: LMH004"));
     assert!(stderr.contains("[fixable]") && stderr.contains("Expected header:"));
     let action_output = root.join("github-output.txt");
@@ -944,6 +945,11 @@ fn text_diagnostics_and_action_outputs_remain_compatible() {
             .unwrap()
             .contains("Updated headers:\n- src/stale.py\n")
     );
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("Checked 2 files.")
+    );
     let output = Command::new(env!("CARGO_BIN_EXE_lmh"))
         .current_dir(root)
         .env("GITHUB_OUTPUT", &action_output)
@@ -962,6 +968,54 @@ fn text_diagnostics_and_action_outputs_remain_compatible() {
             .unwrap()
             .ends_with("issues=[]\nchanged=[]\n")
     );
+}
+
+#[test]
+fn zero_file_text_summary_names_languages_and_json_stays_quiet() {
+    let dir = workspace();
+    let root = dir.path();
+    write(root, "src/source.ts", "export const value = 1;\n");
+
+    let output = run(root, &["check"], 0);
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("Checked 0 files."));
+    assert!(stderr.contains("Enabled languages: python"));
+    assert!(stderr.contains("default is Python"));
+    assert!(stderr.contains("--languages"));
+
+    let result = json_run(root, &["check"], 0);
+    assert_eq!(result["schema_version"], 1);
+    assert_eq!(result["checked"], 0);
+    assert_eq!(result["diagnostics"], json!([]));
+}
+
+#[test]
+fn gitignore_selects_directory_and_explicit_paths() {
+    let dir = workspace();
+    let root = dir.path();
+    write(
+        root,
+        "pyproject.toml",
+        format!("{CONFIG}respect-gitignore = true\n"),
+    );
+    write(root, ".gitignore", "ignored.py\n");
+    for name in ["ignored.py", "keep.py", "generated/out.py"] {
+        write(root, &format!("src/{name}"), header(year()));
+    }
+
+    let result = json_run(root, &["check"], 0);
+    assert_eq!(result["checked"], 2);
+
+    let explicit = json_run(root, &["check", "src/ignored.py"], 0);
+    assert_eq!(explicit["checked"], 1);
+
+    let no_gitignore = json_run(root, &["check", "--respect-gitignore=false"], 0);
+    assert_eq!(no_gitignore["checked"], 3);
+
+    write(root, ".gitignore", "[z-a]\n");
+    let malformed_ignore = json_run(root, &["check"], 2);
+    assert_eq!(malformed_ignore["error"]["code"], "LMH900");
 }
 
 #[test]
@@ -1256,7 +1310,7 @@ fn custom_notices_require_text_and_match_complete_lines() {
 }
 
 #[test]
-fn invalid_config_is_rejected_before_any_write() {
+fn invalid_config_and_options_are_rejected_before_any_write() {
     let dir = workspace();
     let root = dir.path();
     let stale = header(year() - 2);
@@ -1279,6 +1333,7 @@ fn invalid_config_is_rejected_before_any_write() {
         ("languages", "'typescript'"),
         ("ignore-files", "[42]"),
         ("ignore-folders", "true"),
+        ("respect-gitignore", "'yes'"),
         ("unknown-key", "true"),
     ] {
         let filtered: Vec<_> = CONFIG
@@ -1316,6 +1371,7 @@ fn invalid_config_is_rejected_before_any_write() {
     write(root, "pyproject.toml", CONFIG);
     let future = (year() + 1).to_string();
     for args in [
+        vec!["fix", "--diff"],
         vec!["fix", "--folders", "src", "src/stale.py"],
         vec!["fix", "--license", "made-up-license"],
         vec!["fix", "--config", "missing.toml"],
@@ -1325,6 +1381,7 @@ fn invalid_config_is_rejected_before_any_write() {
     ] {
         assert_eq!(json_run(root, &args, 2)["changed"], json!([]));
     }
+    run(root, &["check", "--diff"], 2);
     let missing = json_run(root, &["check", "--config", "missing.toml"], 2);
     json_run(
         root,
@@ -1617,6 +1674,9 @@ fn symlinks_are_skipped_during_discovery_and_refused_during_fix() {
     let check = json_run(root, &["check", "src/link.py"], 1);
     assert_eq!(check["diagnostics"][0]["code"], "LMH004");
     assert_eq!(check["diagnostics"][0]["fixable"], false);
+    let preview = run(root, &["fix", "--diff", "src/link.py"], 1);
+    assert!(preview.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&preview.stderr).contains("src/link.py:1:1: LMH008"));
     let fixed = json_run(root, &["fix", "src/link.py"], 1);
     assert_eq!(fixed["diagnostics"][0]["code"], "LMH008");
     assert_eq!(fs::read_to_string(&target).unwrap(), stale);
@@ -1711,4 +1771,38 @@ fn pinned_spdx_data_accepts_every_legacy_notice_and_new_identifiers() {
             .unwrap()
             .starts_with(&format!("# Copyright (C) {}, {OWNER}.", year()))
     );
+}
+
+#[test]
+fn fix_diff_previews_repairs_without_writing() {
+    let dir = workspace();
+    let root = dir.path();
+    let first = year() - 2;
+    let stale = header(first);
+    let missing = "value = 1\n";
+    write(root, "src/stale.py", &stale);
+    write(root, "src/missing.py", missing);
+    let output = run(
+        &root.join("src"),
+        &["fix", "--diff", "--creation-year", &first.to_string(), "."],
+        1,
+    );
+    let diff = String::from_utf8_lossy(&output.stdout);
+    for name in ["stale", "missing"] {
+        assert!(diff.contains(&format!("--- a/src/{name}.py\n+++ b/src/{name}.py")));
+    }
+    let current_header = format!("+# Copyright (C) {first}-{}, {OWNER}.", year());
+    assert_eq!(diff.matches(&current_header).count(), 2);
+    assert!(diff.contains(&format!("-# Copyright (C) {first}, {OWNER}.")));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("LMH"));
+    assert_eq!(
+        fs::read_to_string(root.join("src/stale.py")).unwrap(),
+        stale
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("src/missing.py")).unwrap(),
+        missing
+    );
+    let io_error = run(root, &["fix", "--diff", "src/stale.py", "src/absent.py"], 2);
+    assert!(io_error.stdout.is_empty());
 }

@@ -144,6 +144,9 @@ lmh check
 git diff
 ```
 
+Development builds also support `lmh fix --diff` to preview repairs without
+writing source files. See [the repair guide](docs/getting-started.md#refresh-a-stale-year).
+
 A 2026 refresh produces a diff like this:
 
 ```diff
@@ -202,8 +205,10 @@ languages = ["python", "typescript", "rust"]
 
 The default is Python. Configured paths are relative to the policy file; explicit CLI
 paths are relative to the invocation directory. Unsupported extensions are skipped.
-Exclude generated, dependency, and build folders with `ignore-folders`; LMH does not
-infer exclusions from `.gitignore`.
+Exclude generated, dependency, and build folders with `ignore-folders`. Set
+`respect-gitignore = true` to apply `.gitignore` rules during directory scans.
+This option is available from the source checkout and is not in published
+version 0.8.0. Explicitly named files bypass `.gitignore`.
 
 Existing-header repairs require one recognized stale year for the configured owner. Ambiguous layouts,
 wrong owners, future years, unsupported encodings, symlinks/reparse points, multiple hard

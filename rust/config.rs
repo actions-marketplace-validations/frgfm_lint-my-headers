@@ -70,8 +70,21 @@ pub struct Options {
     pub ignore_files: Option<String>,
     #[arg(long)]
     pub ignore_folders: Option<String>,
+    #[arg(
+        long,
+        num_args = 0..=1,
+        default_missing_value = "true",
+        require_equals = true,
+        help = "Apply .gitignore rules to directory scans; use =false to override"
+    )]
+    pub respect_gitignore: Option<bool>,
     #[arg(long, value_enum, default_value = "text")]
     pub output_format: OutputFormat,
+    #[arg(
+        long,
+        help = "Print safe repair proposals as unified diffs without writing files (fix only)"
+    )]
+    pub diff: bool,
     /// Explicit files or folders; overrides configured paths.
     pub paths: Vec<PathBuf>,
 }
@@ -185,6 +198,7 @@ fn config_table(path: &Path) -> Result<Option<Table>, String> {
                 }
                 _ => Some("expected an array of non-empty strings"),
             },
+            "respect-gitignore" => value.as_bool().is_none().then_some("expected a boolean"),
             _ => Some("unknown key"),
         };
         if let Some(reason) = reason {
@@ -291,6 +305,12 @@ pub fn resolve(options: &Options) -> Result<Settings, String> {
                 .map(|s| root.join(s))
                 .collect()
         });
+    let respect_gitignore = options.respect_gitignore.unwrap_or_else(|| {
+        table
+            .get("respect-gitignore")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    });
     Ok(Settings {
         owner,
         year,
@@ -312,6 +332,7 @@ pub fn resolve(options: &Options) -> Result<Settings, String> {
         }),
         ignore_files,
         ignore_folders,
+        respect_gitignore,
         project_root: root,
         config_path,
     })
